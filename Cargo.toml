@@ -10,10 +10,6 @@ license = "MIT"
 name = "santosobot"
 path = "src/main.rs"
 
-[[bin]]
-name = "tool_test"
-path = "tool_test.rs"
-
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }

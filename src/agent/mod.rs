@@ -185,7 +185,7 @@ impl AgentLoop {
             iteration += 1;
 
             let tools = self.tools.read().await;
-            let tool_defs = tools.get_definitions();
+            let _tool_defs = tools.get_definitions();
 
             tracing::info!("Iteration {}: Sending request", iteration);
             

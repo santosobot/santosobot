@@ -167,7 +167,7 @@ pub struct LLMResponse {
 }
 
 impl LLMResponse {
-    pub fn has_tool_calls(&self) -> bool {
+    pub fn _has_tool_calls(&self) -> bool {
         !self.tool_calls.is_empty()
     }
 }
