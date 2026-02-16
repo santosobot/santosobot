@@ -61,18 +61,18 @@ impl Tool for MessageTool {
         let content = args["content"]
             .as_str()
             .ok_or("Missing content parameter")?;
-        
+
         let channel = args["channel"]
             .as_str()
-            .or_else(|| self.chat_id.as_deref())
+            .or(self.chat_id.as_deref())
             .ok_or("Missing channel parameter")?;
-        
+
         let chat_id = args["chat_id"]
             .as_str()
-            .or_else(|| self.chat_id.as_deref())
+            .or(self.chat_id.as_deref())
             .unwrap_or("default")
             .to_string();
-        
+
         if let Some(ref sender) = self.sender {
             let msg = OutboundMessage::new(channel.to_string(), chat_id, content.to_string());
             sender.send(msg).await
@@ -81,6 +81,10 @@ impl Tool for MessageTool {
         } else {
             Err("Message sender not configured".to_string())
         }
+    }
+    
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

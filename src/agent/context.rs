@@ -144,3 +144,71 @@ When remembering something important, write to {}/memory/MEMORY.md"#,
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use std::fs;
+
+    #[test]
+    fn test_context_builder_creation() {
+        let temp_dir = TempDir::new().unwrap();
+        let context_builder = ContextBuilder::new(temp_dir.path());
+
+        assert_eq!(context_builder.workspace, temp_dir.path());
+    }
+
+    #[test]
+    fn test_build_system_prompt() {
+        let temp_dir = TempDir::new().unwrap();
+        let context_builder = ContextBuilder::new(temp_dir.path());
+
+        let prompt = context_builder.build_system_prompt();
+        
+        // Check that the prompt contains expected elements
+        assert!(prompt.contains("# Santoso 🤖"));
+        assert!(prompt.contains("You are Santoso, a helpful AI assistant."));
+        assert!(prompt.contains("Workspace"));
+        assert!(prompt.contains("Your Capabilities"));
+    }
+
+    #[test]
+    fn test_build_messages() {
+        let temp_dir = TempDir::new().unwrap();
+        let context_builder = ContextBuilder::new(temp_dir.path());
+
+        let history = vec![
+            serde_json::json!({"role": "user", "content": "Hello"}),
+            serde_json::json!({"role": "assistant", "content": "Hi there!"}),
+        ];
+        
+        let messages = context_builder.build_messages(&history, "How are you?", Some("cli"), Some("test-chat"));
+        
+        // Should have system message, history messages, and current message
+        assert!(messages.len() >= 3); // At least system, 2 history items, and current
+        
+        // First message should be system
+        assert_eq!(messages[0].role, "system");
+        
+        // Last message should be the current one
+        assert_eq!(messages[messages.len()-1].role, "user");
+        assert_eq!(messages[messages.len()-1].content, "How are you?");
+    }
+
+    #[test]
+    fn test_load_bootstrap_files() {
+        let temp_dir = TempDir::new().unwrap();
+        
+        // Create a bootstrap file
+        let agents_file = temp_dir.path().join("AGENTS.md");
+        fs::write(&agents_file, "# Agents\nSpecialized agents for various tasks").unwrap();
+        
+        let context_builder = ContextBuilder::new(temp_dir.path());
+        // Note: load_bootstrap_files is private, so we test it indirectly through build_system_prompt
+        let prompt = context_builder.build_system_prompt();
+        
+        assert!(prompt.contains("## AGENTS.md"));
+        assert!(prompt.contains("Specialized agents for various tasks"));
+    }
+}

@@ -61,3 +61,53 @@ impl Default for MessageBus {
         Self::new(100)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_test;
+
+    #[tokio::test]
+    async fn test_message_bus_creation() {
+        let bus = MessageBus::new(10);
+        assert_eq!(bus.inbound_size(), 10);
+        assert_eq!(bus.outbound_size(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_message_bus_publish_and_consume_inbound() {
+        let mut bus = MessageBus::new(10);
+        let test_msg = InboundMessage::new(
+            "test".to_string(),
+            "user123".to_string(),
+            "chat456".to_string(),
+            "Test message".to_string(),
+        );
+
+        bus.publish_inbound(test_msg.clone()).await;
+        let received_msg = bus.consume_inbound().await;
+
+        assert!(received_msg.is_some());
+        let received_msg = received_msg.unwrap();
+        assert_eq!(received_msg.channel, test_msg.channel);
+        assert_eq!(received_msg.content, test_msg.content);
+    }
+
+    #[tokio::test]
+    async fn test_message_bus_publish_and_consume_outbound() {
+        let mut bus = MessageBus::new(10);
+        let test_msg = OutboundMessage::new(
+            "test".to_string(),
+            "chat456".to_string(),
+            "Test message".to_string(),
+        );
+
+        bus.publish_outbound(test_msg.clone()).await;
+        let received_msg = bus.consume_outbound().await;
+
+        assert!(received_msg.is_some());
+        let received_msg = received_msg.unwrap();
+        assert_eq!(received_msg.channel, test_msg.channel);
+        assert_eq!(received_msg.content, test_msg.content);
+    }
+}

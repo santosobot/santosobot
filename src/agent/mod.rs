@@ -74,7 +74,6 @@ impl AgentLoop {
         tools.register(ShellTool::new(
             workspace.display().to_string(),
             config.tools.shell_timeout,
-            config.tools.restrict_to_workspace,
         ));
         
         tools.register(WebFetchTool::new());

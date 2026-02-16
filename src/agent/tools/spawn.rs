@@ -60,20 +60,24 @@ impl Tool for SpawnTool {
         let name = args["name"]
             .as_str()
             .ok_or("Missing name parameter")?;
-        
+
         let task = args["task"]
             .as_str()
             .ok_or("Missing task parameter")?;
-        
+
         let subagent = Subagent {
             name: name.to_string(),
             task: task.to_string(),
             status: "pending".to_string(),
         };
-        
+
         self.subagents.write().await.insert(name.to_string(), subagent);
-        
+
         Ok(format!("Subagent '{}' spawned with task: {}", name, task))
+    }
+    
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

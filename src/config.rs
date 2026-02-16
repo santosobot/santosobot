@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
@@ -66,6 +66,8 @@ pub struct ProviderConfig {
     #[serde(default = "default_api_base")]
     pub api_base: String,
     pub model: String,
+    #[serde(default)]
+    pub brave_api_key: String,
 }
 
 fn default_api_base() -> String {
@@ -78,6 +80,7 @@ impl Default for ProviderConfig {
             api_key: String::new(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: String::new(),
+            brave_api_key: String::new(),
         }
     }
 }
@@ -103,7 +106,7 @@ impl Default for ToolsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChannelsConfig {
     #[serde(default)]
     pub telegram: TelegramConfig,
@@ -111,16 +114,7 @@ pub struct ChannelsConfig {
     pub cli: CliConfig,
 }
 
-impl Default for ChannelsConfig {
-    fn default() -> Self {
-        Self {
-            telegram: TelegramConfig::default(),
-            cli: CliConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TelegramConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -128,16 +122,6 @@ pub struct TelegramConfig {
     pub token: String,
     #[serde(default)]
     pub allow_from: Vec<String>,
-}
-
-impl Default for TelegramConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            token: String::new(),
-            allow_from: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,5 +153,106 @@ impl Config {
             &dirs::home_dir().unwrap_or_default().display().to_string(),
         );
         PathBuf::from(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_config_defaults() {
+        let config = super::Config::default();
+        
+        assert_eq!(config.agent.model, "gpt-4o-mini");
+        assert_eq!(config.agent.max_tokens, 8192);
+        assert_eq!(config.agent.temperature, 0.7);
+        assert_eq!(config.agent.max_iterations, 20);
+        assert_eq!(config.agent.memory_window, 50);
+        assert_eq!(config.agent.workspace, "~/.santosobot/workspace");
+        
+        assert_eq!(config.provider.api_base, "https://api.openai.com/v1");
+        assert!(config.provider.api_key.is_empty());
+        assert!(config.provider.model.is_empty());
+        assert!(config.provider.brave_api_key.is_empty());
+        
+        assert_eq!(config.tools.shell_timeout, 60);
+        assert!(!config.tools.restrict_to_workspace);
+        
+        assert!(!config.channels.telegram.enabled);
+        assert!(config.channels.telegram.token.is_empty());
+        assert!(config.channels.telegram.allow_from.is_empty());
+        
+        assert!(config.channels.cli.enabled);
+    }
+
+    #[test]
+    fn test_workspace_path_expansion() {
+        let mut config = super::Config::default();
+        config.agent.workspace = "~/test_workspace".to_string();
+        
+        let path = config.workspace_path();
+        let home_dir = dirs::home_dir().unwrap_or_default();
+        let expected = home_dir.join("test_workspace");
+        
+        assert_eq!(path, expected);
+    }
+
+    #[test]
+    fn test_load_config_from_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        
+        let config_content = r#"# Santosobot Configuration
+[agent]
+model = "gpt-4-test"
+max_tokens = 4096
+temperature = 0.5
+max_iterations = 10
+memory_window = 25
+
+[provider]
+api_key = "test-key-123"
+api_base = "https://test-api.example.com/v1"
+model = "test-model"
+brave_api_key = "test-brave-key"
+
+[tools]
+shell_timeout = 30
+restrict_to_workspace = true
+
+[channels.telegram]
+enabled = true
+token = "test-token"
+allow_from = ["123456789"]
+
+[channels.cli]
+enabled = false
+"#;
+        
+        std::fs::write(&config_path, config_content).unwrap();
+        
+        let config = super::Config::load(&config_path).unwrap();
+        
+        assert_eq!(config.agent.model, "gpt-4-test");
+        assert_eq!(config.agent.max_tokens, 4096);
+        assert_eq!(config.agent.temperature, 0.5);
+        assert_eq!(config.agent.max_iterations, 10);
+        assert_eq!(config.agent.memory_window, 25);
+        
+        assert_eq!(config.provider.api_key, "test-key-123");
+        assert_eq!(config.provider.api_base, "https://test-api.example.com/v1");
+        assert_eq!(config.provider.model, "test-model");
+        assert_eq!(config.provider.brave_api_key, "test-brave-key");
+        
+        assert_eq!(config.tools.shell_timeout, 30);
+        assert!(config.tools.restrict_to_workspace);
+        
+        assert!(config.channels.telegram.enabled);
+        assert_eq!(config.channels.telegram.token, "test-token");
+        assert_eq!(config.channels.telegram.allow_from, vec!["123456789"]);
+        
+        assert!(!config.channels.cli.enabled);
     }
 }

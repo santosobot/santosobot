@@ -179,23 +179,52 @@ impl From<ChatResponse> for LLMResponse {
 
         let content = msg.and_then(|m| m.content().map(|s| s.to_string()));
 
-        let tool_calls = msg
-            .and_then(|m| m.tool_calls())
-            .map(|calls| {
-                calls
-                    .iter()
-                    .map(|tc| {
-                        let args: HashMap<String, serde_json::Value> =
-                            serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                        ToolCallRequest {
-                            id: tc.id.clone(),
-                            name: tc.function.name.clone(),
-                            arguments: args,
-                        }
+        // Handle the case where finish_reason is "tool_calls" but no actual tool_calls are present in the message
+        let tool_calls = if let Some(choice) = choice {
+            if choice.finish_reason == "tool_calls" {
+                // If finish_reason is "tool_calls" but no tool_calls in message, 
+                // we might need to infer or handle this case specially
+                // For now, we'll check if there are actual tool_calls in the message
+                msg
+                    .and_then(|m| m.tool_calls())
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .map(|tc| {
+                                let args: HashMap<String, serde_json::Value> =
+                                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                                ToolCallRequest {
+                                    id: tc.id.clone(),
+                                    name: tc.function.name.clone(),
+                                    arguments: args,
+                                }
+                            })
+                            .collect()
                     })
-                    .collect()
-            })
-            .unwrap_or_default();
+                    .unwrap_or_default()
+            } else {
+                // Normal case - not a tool_calls finish reason
+                msg
+                    .and_then(|m| m.tool_calls())
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .map(|tc| {
+                                let args: HashMap<String, serde_json::Value> =
+                                    serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                                ToolCallRequest {
+                                    id: tc.id.clone(),
+                                    name: tc.function.name.clone(),
+                                    arguments: args,
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+        } else {
+            vec![]
+        };
 
         let finish_reason = choice.map(|c| c.finish_reason.clone()).unwrap_or_default();
 
@@ -205,5 +234,67 @@ impl From<ChatResponse> for LLMResponse {
             finish_reason,
             usage: resp.usage,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chat_message_creation() {
+        let system_msg = ChatMessage::system("System message");
+        assert_eq!(system_msg.role, "system");
+        assert_eq!(system_msg.content, "System message");
+
+        let user_msg = ChatMessage::user("User message");
+        assert_eq!(user_msg.role, "user");
+        assert_eq!(user_msg.content, "User message");
+
+        let assistant_msg = ChatMessage::assistant("Assistant message");
+        assert_eq!(assistant_msg.role, "assistant");
+        assert_eq!(assistant_msg.content, "Assistant message");
+
+        let tool_msg = ChatMessage::tool("Tool result", "call_123");
+        assert_eq!(tool_msg.role, "tool");
+        assert_eq!(tool_msg.content, "Tool result");
+        assert_eq!(tool_msg.tool_call_id, Some("call_123".to_string()));
+    }
+
+    #[test]
+    fn test_llm_response_has_tool_calls() {
+        let mut response = LLMResponse {
+            content: Some("Hello".to_string()),
+            tool_calls: vec![],
+            finish_reason: "stop".to_string(),
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
+        };
+
+        assert!(!response.has_tool_calls());
+
+        response.tool_calls.push(ToolCallRequest {
+            id: "call_123".to_string(),
+            name: "test_tool".to_string(),
+            arguments: HashMap::new(),
+        });
+
+        assert!(response.has_tool_calls());
+    }
+
+    #[test]
+    fn test_usage_struct() {
+        let usage = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+        };
+
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 50);
+        assert_eq!(usage.total_tokens, 150);
     }
 }

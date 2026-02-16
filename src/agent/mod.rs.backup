@@ -1,0 +1,857 @@
+mod context;
+mod memory;
+mod tools;
+
+pub use context::ContextBuilder;
+pub use memory::MemoryStore;
+
+use std::path::{Path, PathBuf};
+use tokio::sync::RwLock;
+
+#[allow(dead_code)]
+use crate::bus::{InboundMessage, OutboundMessage};
+use crate::config::Config;
+use crate::providers::{ChatMessage, OpenAIProvider};
+use crate::agent::tools::{BraveSearchTool, EditFileTool, ListDirTool, ReadFileTool, ShellTool, ToolRegistry, WebFetchTool, WriteFileTool, ReminderTool};
+
+pub struct AgentLoop {
+    inbound_rx: tokio::sync::mpsc::Receiver<InboundMessage>,
+    provider: OpenAIProvider,
+    workspace: PathBuf,
+    model: String,
+    max_iterations: u32,
+    temperature: f32,
+    max_tokens: u32,
+    memory_window: u32,
+    tools: RwLock<ToolRegistry>,
+    context: ContextBuilder,
+    session_history: RwLock<Vec<serde_json::Value>>,
+    #[allow(dead_code)]
+    outbound_tx: tokio::sync::mpsc::Sender<OutboundMessage>,
+}
+
+impl AgentLoop {
+    pub fn new(
+        config: &Config,
+        inbound_rx: tokio::sync::mpsc::Receiver<InboundMessage>,
+        outbound_tx: tokio::sync::mpsc::Sender<OutboundMessage>,
+    ) -> Self {
+        let workspace = config.workspace_path();
+        let provider = OpenAIProvider::new(config.provider.clone());
+
+        let tools = Self::create_tools(config, &workspace);
+
+        Self {
+            inbound_rx,
+            provider,
+            workspace,
+            model: config.agent.model.clone(),
+            max_iterations: config.agent.max_iterations,
+            temperature: config.agent.temperature,
+            max_tokens: config.agent.max_tokens,
+            memory_window: config.agent.memory_window,
+            tools: RwLock::new(tools),
+            context: ContextBuilder::new(&config.workspace_path()),
+            session_history: RwLock::new(Vec::new()),
+            outbound_tx,
+        }
+    }
+
+    fn create_tools(config: &Config, workspace: &Path) -> (ToolRegistry, Option<Arc<ReminderTool>>) {
+        let mut tools = ToolRegistry::new();
+
+        let allowed_dir = if config.tools.restrict_to_workspace {
+            Some(workspace.to_path_buf())
+        } else {
+            None
+        };
+
+        tools.register(ReadFileTool::new(allowed_dir.clone()));
+        tools.register(WriteFileTool::new(allowed_dir.clone()));
+        tools.register(EditFileTool::new(allowed_dir.clone()));
+        tools.register(ListDirTool::new(allowed_dir));
+
+        tools.register(ShellTool::new(
+            workspace.display().to_string(),
+            config.tools.shell_timeout,
+        ));
+
+        tools.register(WebFetchTool::new());
+
+        // Register Brave Search tool if API key is provided
+        if !config.provider.brave_api_key.is_empty() {
+            tools.register(BraveSearchTool::new(config.provider.brave_api_key.clone()));
+        }
+
+        // Create and register the reminder tool
+        let reminder_tool = ReminderTool::new();
+        tools.register(reminder_tool);
+
+        tools
+    }
+    }
+
+    #[allow(dead_code)]
+    pub async fn register_message_tool(&self, _sender: tokio::sync::mpsc::Sender<OutboundMessage>) {
+        // This would need to be done differently in actual implementation
+    }
+
+    pub async fn run(&mut self) {
+        tracing::info!("Agent loop started");
+        
+        loop {
+            tokio::select! {
+                msg = self.inbound_rx.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            if let Err(e) = self.process_message(msg).await {
+                                tracing::error!("Error processing message: {}", e);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    // Brief pause to prevent busy loop
+                }
+            }
+        }
+        
+        tracing::info!("Agent loop stopped");
+    }
+
+    async fn process_message(&mut self, msg: InboundMessage) -> Result<(), String> {
+        tracing::info!("Processing message from {}: {}", msg.channel, &msg.content[..msg.content.len().min(50)]);
+        
+        let messages = self.context.build_messages(
+            &self.session_history.read().await,
+            &msg.content,
+            Some(&msg.channel),
+            Some(&msg.chat_id),
+        );
+        
+        let (final_content, tools_used) = self.run_agent_loop(messages).await?;
+        
+        let response = final_content.unwrap_or_else(|| "I've completed processing but have no response to give.".to_string());
+        
+        self.session_history.write().await.push(serde_json::json!({
+            "role": "user",
+            "content": msg.content,
+        }));
+        
+        self.session_history.write().await.push(serde_json::json!({
+            "role": "assistant",
+            "content": response,
+            "tools_used": tools_used,
+        }));
+        
+        if self.session_history.read().await.len() > self.memory_window as usize * 2 {
+            self.consolidate_memory().await;
+        }
+        
+        let outbound = OutboundMessage::new(msg.channel, msg.chat_id, response);
+        self.outbound_tx.send(outbound).await.map_err(|e| e.to_string())?;
+        
+        Ok(())
+    }
+
+    async fn run_agent_loop(&self, mut messages: Vec<ChatMessage>) -> Result<(Option<String>, Vec<String>), String> {
+        let mut iteration = 0;
+        let mut final_content: Option<String> = None;
+        let mut tools_used = Vec::new();
+
+        while iteration < self.max_iterations {
+            iteration += 1;
+            tracing::debug!("Agent loop iteration: {}", iteration);
+
+            let tools = self.tools.read().await;
+            let tool_defs = tools.get_definitions();
+
+            let response = self.provider.chat(
+                messages.clone(),
+                if tool_defs.is_empty() { None } else { Some(tool_defs) },
+                Some(self.model.clone()),
+                Some(self.temperature),
+                Some(self.max_tokens),
+            ).await.map_err(|e| e.to_string())?;
+
+            tracing::debug!("LLM response received. Has tool calls: {}, Content: {:?}", 
+                           response.has_tool_calls(), 
+                           response.content.as_deref().unwrap_or("None"));
+
+            if response.has_tool_calls() {
+                let content = response.content.as_deref().unwrap_or("");
+                tracing::debug!("Adding assistant message with content: '{}'", content);
+                messages.push(ChatMessage::assistant(content));
+
+                for tc in &response.tool_calls {
+                    tools_used.push(tc.name.clone());
+                    tracing::info!("Executing tool call: {}({:?})", tc.name, tc.arguments);
+
+                    let result = self.tools.read().await
+                        .execute(&tc.name, serde_json::to_value(&tc.arguments).unwrap_or_default())
+                        .await;
+
+                    let result_str = match result {
+                        Ok(r) => {
+                            tracing::info!("Tool '{}' executed successfully, result: {:?}", tc.name, r);
+                            r
+                        },
+                        Err(e) => {
+                            let error_msg = format!("Error executing tool '{}': {}", tc.name, e);
+                            tracing::warn!("{}", error_msg);
+                            error_msg
+                        },
+                    };
+
+                    tracing::debug!("Adding tool result message: {:?}", result_str);
+                    messages.push(ChatMessage::tool(&result_str, &tc.id));
+                }
+
+                let next_instruction = "Reflect on the results and decide next steps.";
+                tracing::debug!("Adding user message: {}", next_instruction);
+                messages.push(ChatMessage::user(next_instruction));
+            } else if response.finish_reason == "tool_calls" && response.content.as_deref().unwrap_or("").is_empty() {
+                // Special case: LLM indicated tool_calls as finish reason but didn't return actual tool calls
+                // This might happen with certain LLM implementations that recognize the need for tools
+                // but don't format the response correctly
+                tracing::warn!("LLM returned finish_reason='tool_calls' but no actual tool calls. Attempting to parse from user intent...");
+                
+                // Extract the last user message to see if we can determine which tool to call
+                if let Some(last_user_message) = messages.iter().rfind(|m| m.role == "user") {
+                    let user_msg = &last_user_message.content;
+                    
+                    // Enhanced heuristic to detect tool calls in the user message using natural language
+                    let user_msg_lower = user_msg.to_lowercase();
+                    
+                    // Pattern matching for list_dir command
+                    if user_msg_lower.contains("list_dir") || 
+                       user_msg_lower.contains("list file") || 
+                       user_msg_lower.contains("daftar file") || 
+                       user_msg_lower.contains("isi folder") || 
+                       user_msg_lower.contains("isi direktori") ||
+                       (user_msg_lower.contains("list") && (user_msg_lower.contains("folder") || user_msg_lower.contains("directory") || user_msg_lower.contains("dir"))) ||
+                       (user_msg_lower.contains("daftar") && (user_msg_lower.contains("folder") || user_msg_lower.contains("direktori") || user_msg_lower.contains("isi"))) ||
+                       (user_msg_lower.contains("show") && user_msg_lower.contains("contents")) ||
+                       (user_msg_lower.contains("tampilkan") && user_msg_lower.contains("isi")) {
+                        
+                        // Extract path from message using regex
+                        use regex::Regex;
+                        let path_regex = Regex::new(r#""([^"]*)"|'([^']*)'|([^\s,"']+)"#).unwrap_or_else(|_| Regex::new(r#"[^\s]+"#).unwrap());
+                        
+                        let mut path = "/home/chainloader/Downloads"; // default fallback
+                        
+                        // Try to find path in the message
+                        for cap in path_regex.captures_iter(user_msg) {
+                            if let Some(matched) = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)) {
+                                let extracted_path = matched.as_str();
+                                if extracted_path.contains('/') {
+                                    path = extracted_path;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // If no specific path was found, try to extract from keywords
+                        if path == "/home/chainloader/Downloads" {
+                            if user_msg_lower.contains("downloads") {
+                                path = "/home/chainloader/Downloads";
+                            } else if user_msg_lower.contains("documents") {
+                                path = "/home/chainloader/Documents";
+                            } else if user_msg_lower.contains("desktop") {
+                                path = "/home/chainloader/Desktop";
+                            } else if user_msg_lower.contains("home") || user_msg_lower.contains("home directory") {
+                                path = "/home/chainloader";
+                            } else if user_msg_lower.contains("tmp") || user_msg_lower.contains("temp") {
+                                path = "/tmp";
+                            } else if user_msg_lower.contains("etc") && user_msg_lower.contains("hosts") {
+                                path = "/etc";
+                            }
+                        }
+                        
+                        let args = serde_json::json!({"path": path});
+                        match self.tools.read().await.execute("list_dir", args).await {
+                            Ok(result) => {
+                                tracing::info!("Implicit tool execution successful: list_dir({})", path);
+                                tools_used.push("list_dir".to_string());
+                                
+                                // Add the result to messages as if it came from a tool call
+                                messages.push(ChatMessage::tool(&result, "implicit_call"));
+                                
+                                let next_instruction = "Reflect on the results and decide next steps.";
+                                tracing::debug!("Adding user message: {}", next_instruction);
+                                messages.push(ChatMessage::user(next_instruction));
+                            },
+                            Err(e) => {
+                                tracing::warn!("Failed to execute implicit tool call: {}", e);
+                                // Continue with normal flow
+                                final_content = response.content;
+                                break;
+                            }
+                        }
+                    } 
+                    // Pattern matching for read_file command
+                    else if user_msg_lower.contains("read_file") || 
+                             user_msg_lower.contains("read file") || 
+                             user_msg_lower.contains("baca file") || 
+                             user_msg_lower.contains("baca isi") || 
+                             user_msg_lower.contains("isi file") ||
+                             (user_msg_lower.contains("read") && (user_msg_lower.contains("file") || user_msg_lower.contains(".txt") || user_msg_lower.contains(".md") || user_msg_lower.contains(".json") || user_msg_lower.contains(".yaml") || user_msg_lower.contains(".toml"))) ||
+                             (user_msg_lower.contains("baca") && (user_msg_lower.contains("file") || user_msg_lower.contains("isi"))) {
+                        
+                        // Extract file path from message
+                        use regex::Regex;
+                        let path_regex = Regex::new(r#""([^"]*)"|'([^']*)'|([^\s,"']+\.(\w+))"#).unwrap_or_else(|_| Regex::new(r#"[^\s]+"#).unwrap());
+                        
+                        let mut path = "/home/chainloader/.bashrc"; // default fallback
+                        
+                        // Try to find file path in the message
+                        for cap in path_regex.captures_iter(user_msg) {
+                            if let Some(matched) = cap.get(1).or_else(|| cap.get(2)).or_else(|| cap.get(3)) {
+                                let extracted_path = matched.as_str();
+                                if extracted_path.contains('/') || extracted_path.contains('.') {
+                                    path = extracted_path;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        let args = serde_json::json!({"path": path});
+                        match self.tools.read().await.execute("read_file", args).await {
+                            Ok(result) => {
+                                tracing::info!("Implicit tool execution successful: read_file({})", path);
+                                tools_used.push("read_file".to_string());
+                                
+                                // Add the result to messages as if it came from a tool call
+                                messages.push(ChatMessage::tool(&result, "implicit_call"));
+                                
+                                let next_instruction = "Reflect on the results and decide next steps.";
+                                tracing::debug!("Adding user message: {}", next_instruction);
+                                messages.push(ChatMessage::user(next_instruction));
+                            },
+                            Err(e) => {
+                                tracing::warn!("Failed to execute implicit tool call: {}", e);
+                                // Continue with normal flow
+                                final_content = response.content;
+                                break;
+                            }
+                        }
+                    }
+                    // Pattern matching for write_file command
+                    else if user_msg_lower.contains("write_file") || 
+                             user_msg_lower.contains("write file") || 
+                             user_msg_lower.contains("tulis file") || 
+                             user_msg_lower.contains("buat file") || 
+                             user_msg_lower.contains("simpan file") ||
+                             (user_msg_lower.contains("write") && (user_msg_lower.contains("file") || user_msg_lower.contains("to"))) ||
+                             (user_msg_lower.contains("tulis") && (user_msg_lower.contains("file") || user_msg_lower.contains("isi"))) {
+                        
+                        // Extract path and content from message
+                        use regex::Regex;
+                        let path_regex = Regex::new(r#"["']([^"']+)["']|([^\s,]+)"#).unwrap_or_else(|_| Regex::new(r#"[^\s]+"#).unwrap());
+                        let content_regex = Regex::new(r#"["'](.+?)["']|(.+)"#).unwrap_or_else(|_| Regex::new(r#".+"#).unwrap());
+                        
+                        let mut path = "/tmp/default.txt"; // default fallback
+                        let mut content = "Default content"; // default fallback
+                        
+                        // Try to find file path in the message
+                        for cap in path_regex.captures_iter(user_msg) {
+                            if let Some(matched) = cap.get(1).or_else(|| cap.get(2)) {
+                                let extracted_path = matched.as_str();
+                                if extracted_path.contains('/') || extracted_path.contains('.') {
+                                    path = extracted_path;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // Try to find content in the message
+                        for cap in content_regex.captures_iter(user_msg) {
+                            if let Some(matched) = cap.get(1).or_else(|| cap.get(2)) {
+                                let extracted_content = matched.as_str().trim();
+                                if !extracted_content.is_empty() && !extracted_content.contains('/') && !extracted_content.contains('.') {
+                                    content = extracted_content;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        let args = serde_json::json!({"path": path, "content": content});
+                        match self.tools.read().await.execute("write_file", args).await {
+                            Ok(result) => {
+                                tracing::info!("Implicit tool execution successful: write_file({}, {})", path, content);
+                                tools_used.push("write_file".to_string());
+                                
+                                // Add the result to messages as if it came from a tool call
+                                messages.push(ChatMessage::tool(&result, "implicit_call"));
+                                
+                                let next_instruction = "Reflect on the results and decide next steps.";
+                                tracing::debug!("Adding user message: {}", next_instruction);
+                                messages.push(ChatMessage::user(next_instruction));
+                            },
+                            Err(e) => {
+                                tracing::warn!("Failed to execute implicit tool call: {}", e);
+                                // Continue with normal flow
+                                final_content = response.content;
+                                break;
+                            }
+                        }
+                    }
+                    // Pattern matching for edit_file command
+                    else if user_msg_lower.contains("edit_file") || 
+                             user_msg_lower.contains("edit file") || 
+                             user_msg_lower.contains("ubah file") || 
+                             user_msg_lower.contains("ganti isi") || 
+                             user_msg_lower.contains("replace") ||
+                             (user_msg_lower.contains("edit") && (user_msg_lower.contains("file") || user_msg_lower.contains("text"))) ||
+                             (user_msg_lower.contains("ubah") && (user_msg_lower.contains("isi") || user_msg_lower.contains("teks"))) {
+                        
+                        // Extract path, old_string, and new_string from message
+                        use regex::Regex;
+                        let path_regex = Regex::new(r#"["']([^"']+)["']|([^\s,]+)"#).unwrap_or_else(|_| Regex::new(r#"[^\s]+"#).unwrap());
+                        let old_string_regex = Regex::new(r#"old['"]?\s*[=:]\s*["']([^"']+)["']|old\s+([^,\s]+)"#).unwrap_or_else(|_| Regex::new(r#"[^\s]+"#).unwrap());
+                        let new_string_regex = Regex::new(r#"new['"]?\s*[=:]\s*["']([^"']+)["']|new\s+([^,\s]+)"#).unwrap_or_else(|_| Regex::new(r#"[^\s]+"#).unwrap());
+                        
+                        let mut path = "/tmp/default.txt"; // default fallback
+                        let mut old_string = "old_text"; // default fallback
+                        let mut new_string = "new_text"; // default fallback
+                        
+                        // Try to find file path in the message
+                        for cap in path_regex.captures_iter(user_msg) {
+                            if let Some(matched) = cap.get(1).or_else(|| cap.get(2)) {
+                                let extracted_path = matched.as_str();
+                                if extracted_path.contains('/') || extracted_path.contains('.') {
+                                    path = extracted_path;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // Try to find old string in the message
+                        for cap in old_string_regex.captures_iter(user_msg) {
+                            if let Some(matched) = cap.get(1).or_else(|| cap.get(2)) {
+                                let extracted_old = matched.as_str().trim();
+                                if !extracted_old.is_empty() {
+                                    old_string = extracted_old;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // Try to find new string in the message
+                        for cap in new_string_regex.captures_iter(user_msg) {
+                            if let Some(matched) = cap.get(1).or_else(|| cap.get(2)) {
+                                let extracted_new = matched.as_str().trim();
+                                if !extracted_new.is_empty() {
+                                    new_string = extracted_new;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        let args = serde_json::json!({"path": path, "old_string": old_string, "new_string": new_string});
+                        match self.tools.read().await.execute("edit_file", args).await {
+                            Ok(result) => {
+                                tracing::info!("Implicit tool execution successful: edit_file({}, {}, {})", path, old_string, new_string);
+                                tools_used.push("edit_file".to_string());
+                                
+                                // Add the result to messages as if it came from a tool call
+                                messages.push(ChatMessage::tool(&result, "implicit_call"));
+                                
+                                let next_instruction = "Reflect on the results and decide next steps.";
+                                tracing::debug!("Adding user message: {}", next_instruction);
+                                messages.push(ChatMessage::user(next_instruction));
+                            },
+                            Err(e) => {
+                                tracing::warn!("Failed to execute implicit tool call: {}", e);
+                                // Continue with normal flow
+                                final_content = response.content;
+                                break;
+                            }
+                        }
+                    }
+                    // Pattern matching for shell command
+                    else if user_msg_lower.contains("shell") || 
+                             user_msg_lower.contains("execute") || 
+                             user_msg_lower.contains("run") || 
+                             user_msg_lower.contains("command") ||
+                             user_msg_lower.contains("jalankan") ||
+                             user_msg_lower.contains("eksekusi") ||
+                             (user_msg_lower.contains("run") && (user_msg_lower.contains("command") || user_msg_lower.contains("script") || user_msg_lower.contains("program"))) {
+                        
+                        // Extract command from message
+                        use regex::Regex;
+                        let cmd_regex = Regex::new(r#"["'](.+?)["']|(.+)"#).unwrap_or_else(|_| Regex::new(r#"[^\s]+"#).unwrap());
+                        
+                        let mut command = "echo 'No command specified'"; // default fallback
+                        
+                        // Try to find command in the message
+                        for cap in cmd_regex.captures_iter(user_msg) {
+                            if let Some(matched) = cap.get(1).or_else(|| cap.get(2)) {
+                                let extracted_cmd = matched.as_str().trim();
+                                if !extracted_cmd.is_empty() && extracted_cmd != user_msg.trim() {
+                                    command = extracted_cmd;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        let args = serde_json::json!({"command": command});
+                        match self.tools.read().await.execute("shell", args).await {
+                            Ok(result) => {
+                                tracing::info!("Implicit tool execution successful: shell({})", command);
+                                tools_used.push("shell".to_string());
+                                
+                                // Add the result to messages as if it came from a tool call
+                                messages.push(ChatMessage::tool(&result, "implicit_call"));
+                                
+                                let next_instruction = "Reflect on the results and decide next steps.";
+                                tracing::debug!("Adding user message: {}", next_instruction);
+                                messages.push(ChatMessage::user(next_instruction));
+                            },
+                            Err(e) => {
+                                tracing::warn!("Failed to execute implicit tool call: {}", e);
+                                // Continue with normal flow
+                                final_content = response.content;
+                                break;
+                            }
+                        }
+                    }
+                    // Pattern matching for web_fetch command
+                    else if user_msg_lower.contains("web_fetch") || 
+                             user_msg_lower.contains("fetch") || 
+                             user_msg_lower.contains("ambil") || 
+                             user_msg_lower.contains("download") || 
+                             user_msg_lower.contains("get url") ||
+                             (user_msg_lower.contains("fetch") && (user_msg_lower.contains("url") || user_msg_lower.contains("web") || user_msg_lower.contains("page"))) ||
+                             (user_msg_lower.contains("ambil") && (user_msg_lower.contains("url") || user_msg_lower.contains("konten"))) {
+                        
+                        // Extract URL from message
+                        use regex::Regex;
+                        let url_regex = Regex::new(r#"https?://[^\s"<>\]]+"#).unwrap_or_else(|_| Regex::new(r#"www\.[^\s"<>\]]+"#).unwrap());
+                        
+                        let mut url = "https://example.com"; // default fallback
+                        
+                        // Try to find URL in the message
+                        for cap in url_regex.captures_iter(user_msg) {
+                            if let Some(matched) = cap.get(0) {
+                                let extracted_url = matched.as_str();
+                                if extracted_url.starts_with("http") || extracted_url.starts_with("www.") {
+                                    url = extracted_url;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        let args = serde_json::json!({"url": url});
+                        match self.tools.read().await.execute("web_fetch", args).await {
+                            Ok(result) => {
+                                tracing::info!("Implicit tool execution successful: web_fetch({})", url);
+                                tools_used.push("web_fetch".to_string());
+                                
+                                // Add the result to messages as if it came from a tool call
+                                messages.push(ChatMessage::tool(&result, "implicit_call"));
+                                
+                                let next_instruction = "Reflect on the results and decide next steps.";
+                                tracing::debug!("Adding user message: {}", next_instruction);
+                                messages.push(ChatMessage::user(next_instruction));
+                            },
+                            Err(e) => {
+                                tracing::warn!("Failed to execute implicit tool call: {}", e);
+                                // Continue with normal flow
+                                final_content = response.content;
+                                break;
+                            }
+                        }
+                    }
+                    // Pattern matching for brave_search command
+                    else if user_msg_lower.contains("brave_search") || 
+                             user_msg_lower.contains("search") || 
+                             user_msg_lower.contains("cari") || 
+                             user_msg_lower.contains("google") || 
+                             user_msg_lower.contains("find") ||
+                             (user_msg_lower.contains("search") && (user_msg_lower.contains("web") || user_msg_lower.contains("internet") || user_msg_lower.contains("online"))) ||
+                             (user_msg_lower.contains("cari") && (user_msg_lower.contains("di web") || user_msg_lower.contains("di internet") || user_msg_lower.contains("informasi"))) {
+                        
+                        // Extract search query from message
+                        use regex::Regex;
+                        let query_regex = Regex::new(r#"["'](.+?)["']|(.+)"#).unwrap_or_else(|_| Regex::new(r#"[^\s]+"#).unwrap());
+                        
+                        let mut query = "default search query"; // default fallback
+                        
+                        // Try to find search query in the message
+                        for cap in query_regex.captures_iter(user_msg) {
+                            if let Some(matched) = cap.get(1).or_else(|| cap.get(2)) {
+                                let extracted_query = matched.as_str().trim();
+                                if !extracted_query.is_empty() && extracted_query != user_msg.trim() {
+                                    query = extracted_query;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        let args = serde_json::json!({"query": query});
+                        match self.tools.read().await.execute("brave_search", args).await {
+                            Ok(result) => {
+                                tracing::info!("Implicit tool execution successful: brave_search({})", query);
+                                tools_used.push("brave_search".to_string());
+                                
+                                // Add the result to messages as if it came from a tool call
+                                messages.push(ChatMessage::tool(&result, "implicit_call"));
+                                
+                                let next_instruction = "Reflect on the results and decide next steps.";
+                                tracing::debug!("Adding user message: {}", next_instruction);
+                                messages.push(ChatMessage::user(next_instruction));
+                            },
+                            Err(e) => {
+                                tracing::warn!("Failed to execute implicit tool call: {}", e);
+                                // Continue with normal flow
+                                final_content = response.content;
+                                break;
+                            }
+                        }
+                    }
+                    // Pattern matching for message command
+                    else if user_msg_lower.contains("message") || 
+                             user_msg_lower.contains("send message") || 
+                             user_msg_lower.contains("kirim pesan") || 
+                             user_msg_lower.contains("pesan ke") || 
+                             user_msg_lower.contains("beri tahu") ||
+                             (user_msg_lower.contains("send") && (user_msg_lower.contains("message") || user_msg_lower.contains("to"))) ||
+                             (user_msg_lower.contains("kirim") && (user_msg_lower.contains("pesan") || user_msg_lower.contains("ke"))) {
+                        
+                        // Extract content and destination from message
+                        use regex::Regex;
+                        let content_regex = Regex::new(r#"["'](.+?)["']|(.+)"#).unwrap_or_else(|_| Regex::new(r#".+"#).unwrap());
+                        
+                        let mut content = "Default message content"; // default fallback
+                        
+                        // Try to find message content in the message
+                        for cap in content_regex.captures_iter(user_msg) {
+                            if let Some(matched) = cap.get(1).or_else(|| cap.get(2)) {
+                                let extracted_content = matched.as_str().trim();
+                                if !extracted_content.is_empty() && extracted_content != user_msg.trim() {
+                                    content = extracted_content;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        let args = serde_json::json!({"content": content, "channel": "telegram", "chat_id": "default"});
+                        match self.tools.read().await.execute("message", args).await {
+                            Ok(result) => {
+                                tracing::info!("Implicit tool execution successful: message({})", content);
+                                tools_used.push("message".to_string());
+                                
+                                // Add the result to messages as if it came from a tool call
+                                messages.push(ChatMessage::tool(&result, "implicit_call"));
+                                
+                                let next_instruction = "Reflect on the results and decide next steps.";
+                                tracing::debug!("Adding user message: {}", next_instruction);
+                                messages.push(ChatMessage::user(next_instruction));
+                            },
+                            Err(e) => {
+                                tracing::warn!("Failed to execute implicit tool call: {}", e);
+                                // Continue with normal flow
+                                final_content = response.content;
+                                break;
+                            }
+                        }
+                    }
+                    // Pattern matching for spawn command
+                    else if user_msg_lower.contains("spawn") || 
+                             user_msg_lower.contains("create subagent") || 
+                             user_msg_lower.contains("buat subagen") || 
+                             user_msg_lower.contains("spawn subagent") || 
+                             user_msg_lower.contains("background task") ||
+                             (user_msg_lower.contains("spawn") && (user_msg_lower.contains("agent") || user_msg_lower.contains("task"))) ||
+                             (user_msg_lower.contains("buat") && (user_msg_lower.contains("subagen") || user_msg_lower.contains("agen"))) {
+                        
+                        // Extract name and task from message
+                        use regex::Regex;
+                        let name_regex = Regex::new(r#"name['"]?\s*[=:]\s*["']([^"']+)["']|name\s+([^,\s]+)"#).unwrap_or_else(|_| Regex::new(r#"[^\s]+"#).unwrap());
+                        let task_regex = Regex::new(r#"task['"]?\s*[=:]\s*["']([^"']+)["']|task\s+(.+)"#).unwrap_or_else(|_| Regex::new(r#".+"#).unwrap());
+                        
+                        let mut name = "default_subagent"; // default fallback
+                        let mut task = "Default background task"; // default fallback
+                        
+                        // Try to find name in the message
+                        for cap in name_regex.captures_iter(user_msg) {
+                            if let Some(matched) = cap.get(1).or_else(|| cap.get(2)) {
+                                let extracted_name = matched.as_str().trim();
+                                if !extracted_name.is_empty() {
+                                    name = extracted_name;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        // Try to find task in the message
+                        for cap in task_regex.captures_iter(user_msg) {
+                            if let Some(matched) = cap.get(1).or_else(|| cap.get(2)) {
+                                let extracted_task = matched.as_str().trim();
+                                if !extracted_task.is_empty() {
+                                    task = extracted_task;
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        let args = serde_json::json!({"name": name, "task": task});
+                        match self.tools.read().await.execute("spawn", args).await {
+                            Ok(result) => {
+                                tracing::info!("Implicit tool execution successful: spawn({}, {})", name, task);
+                                tools_used.push("spawn".to_string());
+                                
+                                // Add the result to messages as if it came from a tool call
+                                messages.push(ChatMessage::tool(&result, "implicit_call"));
+                                
+                                let next_instruction = "Reflect on the results and decide next steps.";
+                                tracing::debug!("Adding user message: {}", next_instruction);
+                                messages.push(ChatMessage::user(next_instruction));
+                            },
+                            Err(e) => {
+                                tracing::warn!("Failed to execute implicit tool call: {}", e);
+                                // Continue with normal flow
+                                final_content = response.content;
+                                break;
+                            }
+                        }
+                    }
+                    else {
+                        tracing::debug!("Could not determine appropriate tool from user message, exiting loop");
+                        final_content = response.content;
+                        break;
+                    }
+                } else {
+                    tracing::debug!("No user message to parse for implicit tool call, exiting loop");
+                    final_content = response.content;
+                    break;
+                }
+            } else {
+                tracing::debug!("No tool calls, setting final content and exiting loop");
+                final_content = response.content;
+                break;
+            }
+        }
+
+        tracing::debug!("Agent loop completed. Final content: {:?}, Tools used: {:?}", 
+                       final_content, tools_used);
+        
+        // If no final content but tools were used, create a summary
+        if final_content.is_none() && !tools_used.is_empty() {
+            let summary = format!("Completed execution of tools: {}", tools_used.join(", "));
+            tracing::info!("No final content from LLM, but tools were used. Returning summary: {}", summary);
+            return Ok((Some(summary), tools_used));
+        }
+
+        Ok((final_content, tools_used))
+    }
+
+    async fn consolidate_memory(&self) {
+        let history = self.session_history.read().await;
+        
+        if history.len() < self.memory_window as usize {
+            return;
+        }
+        
+        // Keep only the most recent messages
+        let keep = history.len() - (self.memory_window as usize / 2);
+        
+        // Save older messages to history file
+        let memory = MemoryStore::new(&self.workspace);
+
+        for msg in history.iter().take(keep) {
+            if let (Some(role), Some(content)) = (
+                msg.get("role").and_then(|v| v.as_str()),
+                msg.get("content").and_then(|v| v.as_str()),
+            ) {
+                let entry = format!("[{}] {}: {}",
+                    chrono::Local::now().format("%Y-%m-%d %H:%M"),
+                    role.to_uppercase(),
+                    content
+                );
+                let _ = memory.append_history(&entry);
+            }
+        }
+        
+        // Rotate history if needed
+        let _ = memory.rotate_history_if_needed(5 * 1024 * 1024); // 5MB threshold
+        
+        tracing::info!("Memory consolidated");
+    }
+
+    pub async fn process_direct(&self, content: &str) -> Result<String, String> {
+        let messages = self.context.build_messages(
+            &self.session_history.read().await,
+            content,
+            Some("cli"),
+            Some("direct"),
+        );
+        
+        let (final_content, _) = self.run_agent_loop(messages).await?;
+
+        Ok(final_content.unwrap_or_else(|| "No response".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+    use crate::config::Config;
+
+    #[tokio::test]
+    async fn test_agent_loop_creation() {
+        let config = Config::default();
+        let (inbound_tx, inbound_rx) = mpsc::channel(10);
+        let (outbound_tx, _outbound_rx) = mpsc::channel(10);
+
+        let agent = AgentLoop::new(&config, inbound_rx, outbound_tx);
+        
+        // Check that agent was created with correct config values
+        assert_eq!(agent.model, config.agent.model);
+        assert_eq!(agent.max_iterations, config.agent.max_iterations);
+        assert_eq!(agent.temperature, config.agent.temperature);
+        assert_eq!(agent.max_tokens, config.agent.max_tokens);
+        assert_eq!(agent.memory_window, config.agent.memory_window);
+    }
+
+    #[tokio::test]
+    async fn test_agent_loop_process_direct_simple() {
+        // For this test, we'll create a minimal agent that doesn't actually call an LLM
+        // Since we can't easily mock the LLM call, we'll focus on the structure
+        let config = Config::default();
+        let (_inbound_tx, inbound_rx) = mpsc::channel(10);
+        let (outbound_tx, _outbound_rx) = mpsc::channel(10);
+
+        let agent = AgentLoop::new(&config, inbound_rx, outbound_tx);
+        
+        // This test would require mocking the OpenAIProvider, which is complex
+        // For now, we'll just ensure the method exists and can be called
+        // In a real scenario, we'd want to mock the provider to test the full flow
+    }
+
+    #[tokio::test]
+    async fn test_create_tools() {
+        let config = Config::default();
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path().to_path_buf();
+
+        let tools = AgentLoop::create_tools(&config, workspace.as_path());
+        
+        // Check that default tools are registered
+        let definitions = tools.get_definitions();
+        
+        // Should have at least the basic tools
+        let tool_names: Vec<String> = definitions.iter()
+            .map(|def| def.function.name.clone())
+            .collect();
+        
+        assert!(tool_names.contains(&"read_file".to_string()));
+        assert!(tool_names.contains(&"write_file".to_string()));
+        assert!(tool_names.contains(&"shell".to_string()));
+        assert!(tool_names.contains(&"web_fetch".to_string()));
+    }
+}

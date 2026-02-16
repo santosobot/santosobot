@@ -62,3 +62,72 @@ impl OutboundMessage {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inbound_message_creation() {
+        let msg = InboundMessage::new(
+            "telegram".to_string(),
+            "user123".to_string(),
+            "chat456".to_string(),
+            "Hello!".to_string(),
+        );
+
+        assert_eq!(msg.channel, "telegram");
+        assert_eq!(msg.sender_id, "user123");
+        assert_eq!(msg.chat_id, "chat456");
+        assert_eq!(msg.content, "Hello!");
+        assert!(msg.media.is_empty());
+        assert!(msg.metadata.is_empty());
+    }
+
+    #[test]
+    fn test_outbound_message_creation() {
+        let msg = OutboundMessage::new(
+            "telegram".to_string(),
+            "chat456".to_string(),
+            "Hello back!".to_string(),
+        );
+
+        assert_eq!(msg.channel, "telegram");
+        assert_eq!(msg.chat_id, "chat456");
+        assert_eq!(msg.content, "Hello back!");
+        assert!(msg.metadata.is_empty());
+    }
+
+    #[test]
+    fn test_inbound_message_with_media_and_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert("key1".to_string(), "value1".to_string());
+        
+        let msg = InboundMessage::new(
+            "telegram".to_string(),
+            "user123".to_string(),
+            "chat456".to_string(),
+            "Hello!".to_string(),
+        )
+        .with_media(vec!["image.jpg".to_string()])
+        .with_metadata(metadata);
+
+        assert_eq!(msg.media, vec!["image.jpg"]);
+        assert_eq!(msg.metadata.get("key1").unwrap(), "value1");
+    }
+
+    #[test]
+    fn test_outbound_message_with_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert("key1".to_string(), "value1".to_string());
+        
+        let msg = OutboundMessage::new(
+            "telegram".to_string(),
+            "chat456".to_string(),
+            "Hello back!".to_string(),
+        )
+        .with_metadata(metadata);
+
+        assert_eq!(msg.metadata.get("key1").unwrap(), "value1");
+    }
+}

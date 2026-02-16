@@ -29,7 +29,7 @@ impl OpenAIProvider {
         max_tokens: Option<u32>,
     ) -> Result<LLMResponse, Box<dyn std::error::Error + Send + Sync>> {
         let model = model.unwrap_or_else(|| self.config.model.clone());
-        
+
         let request = ChatRequest {
             model: model.clone(),
             messages,
@@ -38,9 +38,10 @@ impl OpenAIProvider {
             max_tokens,
         };
 
-        let url = format!("{}/chat/completions", self.config.api_base.trim_end_matches('/'));
-        
         info!(model = %model, "Sending chat request");
+        tracing::debug!("Request payload: {:#?}", request);
+
+        let url = format!("{}/chat/completions", self.config.api_base.trim_end_matches('/'));
 
         let response = self.client
             .post(&url)
@@ -58,6 +59,7 @@ impl OpenAIProvider {
         }
 
         let chat_resp: ChatResponse = response.json().await?;
+        tracing::debug!("Response from LLM: {:#?}", chat_resp);
         Ok(chat_resp.into())
     }
 }

@@ -64,6 +64,7 @@ memory_window = 50
 api_key = ""
 api_base = "https://api.openai.com/v1"
 model = ""
+brave_api_key = ""
 
 [tools]
 shell_timeout = 60
