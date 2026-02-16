@@ -32,6 +32,34 @@ impl ContextBuilder {
         parts.join("\n\n---\n\n")
     }
 
+    pub fn build_system_prompt_with_tools(&self, tools_json: &str) -> String {
+        let base_prompt = self.build_system_prompt();
+        
+        format!(
+            r#"{}
+
+## Available Tools
+You have access to the following tools. When you need to use a tool, respond with a JSON object in this format:
+```json
+{{
+    "tool": "tool_name",
+    "arguments": {{
+        "arg1": "value1",
+        "arg2": "value2"
+    }}
+}}
+```
+
+Available tools:
+{}
+
+After receiving the tool result, you can continue with your response or use another tool if needed.
+If the user's request doesn't require any tools, just respond naturally with text."#,
+            base_prompt,
+            tools_json
+        )
+    }
+
     fn get_identity(&self) -> String {
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M (%A)");
         let workspace_path = self.workspace.display();
@@ -95,6 +123,42 @@ When remembering something important, write to {}/memory/MEMORY.md"#,
         let mut messages = Vec::new();
 
         let mut system_prompt = self.build_system_prompt();
+
+        if let (Some(ch), Some(cid)) = (channel, chat_id) {
+            system_prompt.push_str(&format!(
+                "\n\n## Current Session\nChannel: {}\nChat ID: {}",
+                ch, cid
+            ));
+        }
+
+        messages.push(crate::providers::ChatMessage::system(system_prompt));
+
+        for msg in history {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+
+            messages.push(match role {
+                "assistant" => crate::providers::ChatMessage::assistant(content),
+                _ => crate::providers::ChatMessage::user(content),
+            });
+        }
+
+        messages.push(crate::providers::ChatMessage::user(current_message));
+
+        messages
+    }
+
+    pub fn build_messages_with_tools(
+        &self,
+        history: &[serde_json::Value],
+        current_message: &str,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+        tools_json: &str,
+    ) -> Vec<crate::providers::ChatMessage> {
+        let mut messages = Vec::new();
+
+        let mut system_prompt = self.build_system_prompt_with_tools(tools_json);
 
         if let (Some(ch), Some(cid)) = (channel, chat_id) {
             system_prompt.push_str(&format!(

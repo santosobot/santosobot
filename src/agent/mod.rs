@@ -7,12 +7,20 @@ pub use memory::MemoryStore;
 
 use std::path::PathBuf;
 use tokio::sync::RwLock;
+use serde::Deserialize;
 
 #[allow(dead_code)]
 use crate::bus::{InboundMessage, OutboundMessage};
 use crate::config::Config;
 use crate::providers::{ChatMessage, OpenAIProvider};
 use crate::agent::tools::{EditFileTool, ListDirTool, ReadFileTool, ShellTool, ToolRegistry, WebFetchTool, WriteFileTool};
+
+#[derive(Deserialize)]
+struct ToolCallRequest {
+    id: String,
+    name: String,
+    arguments: serde_json::Value,
+}
 
 pub struct AgentLoop {
     inbound_rx: tokio::sync::mpsc::Receiver<InboundMessage>,
@@ -112,36 +120,58 @@ impl AgentLoop {
 
     async fn process_message(&mut self, msg: InboundMessage) -> Result<(), String> {
         tracing::info!("Processing message from {}: {}", msg.channel, &msg.content[..msg.content.len().min(50)]);
-        
-        let messages = self.context.build_messages(
-            &self.session_history.read().await,
-            &msg.content,
-            Some(&msg.channel),
-            Some(&msg.chat_id),
-        );
-        
+
+        let tools = self.tools.read().await;
+        let tool_defs = tools.get_definitions();
+        drop(tools);
+
+        let messages = if !tool_defs.is_empty() {
+            // Use system prompt with tools information
+            let tools_json = serde_json::to_string_pretty(&tool_defs).unwrap_or_default();
+            self.context.build_messages_with_tools(
+                &self.session_history.read().await,
+                &msg.content,
+                Some(&msg.channel),
+                Some(&msg.chat_id),
+                &tools_json,
+            )
+        } else {
+            self.context.build_messages(
+                &self.session_history.read().await,
+                &msg.content,
+                Some(&msg.channel),
+                Some(&msg.chat_id),
+            )
+        };
+
         let (final_content, tools_used) = self.run_agent_loop(messages).await?;
-        
+
         let response = final_content.unwrap_or_else(|| "I've completed processing but have no response to give.".to_string());
-        
+
+        tracing::info!("Agent response generated ({} chars)", response.len());
+
         self.session_history.write().await.push(serde_json::json!({
             "role": "user",
             "content": msg.content,
         }));
-        
+
         self.session_history.write().await.push(serde_json::json!({
             "role": "assistant",
-            "content": response,
+            "content": response.clone(),
             "tools_used": tools_used,
         }));
-        
+
         if self.session_history.read().await.len() > self.memory_window as usize * 2 {
             self.consolidate_memory().await;
         }
-        
-        let outbound = OutboundMessage::new(msg.channel, msg.chat_id, response);
-        self.outbound_tx.send(outbound).await.map_err(|e| e.to_string())?;
-        
+
+        let outbound = OutboundMessage::new(msg.channel.clone(), msg.chat_id.clone(), response.clone());
+        tracing::info!("Sending outbound message to channel: {}", msg.channel);
+        self.outbound_tx.send(outbound).await.map_err(|e| {
+            tracing::error!("Failed to send outbound message: {}", e);
+            e.to_string()
+        })?;
+
         Ok(())
     }
 
@@ -149,49 +179,96 @@ impl AgentLoop {
         let mut iteration = 0;
         let mut final_content: Option<String> = None;
         let mut tools_used = Vec::new();
-        
+        let mut last_tool_results: Vec<String> = Vec::new();
+
         while iteration < self.max_iterations {
             iteration += 1;
-            
+
             let tools = self.tools.read().await;
             let tool_defs = tools.get_definitions();
+
+            tracing::info!("Iteration {}: Sending request", iteration);
             
+            // Don't send tools parameter - model will use JSON format in prompt
             let response = self.provider.chat(
                 messages.clone(),
-                if tool_defs.is_empty() { None } else { Some(tool_defs) },
+                None,
                 Some(self.model.clone()),
                 Some(self.temperature),
                 Some(self.max_tokens),
             ).await.map_err(|e| e.to_string())?;
-            
-            if response.has_tool_calls() {
-                let content = response.content.as_deref().unwrap_or("");
-                messages.push(ChatMessage::assistant(content));
-                
-                for tc in &response.tool_calls {
-                    tools_used.push(tc.name.clone());
-                    tracing::info!("Tool call: {}({:?})", tc.name, tc.arguments);
-                    
-                    let result = self.tools.read().await
-                        .execute(&tc.name, serde_json::to_value(&tc.arguments).unwrap_or_default())
+
+            tracing::info!("LLM response: content length={:?}", response.content.as_ref().map(|c| c.len()));
+
+            // Check if response contains a tool call in JSON format
+            if let Some(content) = &response.content {
+                if let Some(tool_call) = self.parse_tool_call_from_json(content, &tools).await {
+                    tracing::info!("Parsed tool call: {}({:?})", tool_call.name, tool_call.arguments);
+                    tools_used.push(tool_call.name.clone());
+
+                    let result = tools
+                        .execute(&tool_call.name, serde_json::to_value(&tool_call.arguments).unwrap_or_default())
                         .await;
-                    
+
                     let result_str = match result {
                         Ok(r) => r,
                         Err(e) => format!("Error: {}", e),
                     };
+
+                    last_tool_results.push(result_str.clone());
+                    messages.push(ChatMessage::assistant(content.clone()));
+                    messages.push(ChatMessage::tool(&result_str, &tool_call.id));
+                    messages.push(ChatMessage::user("Tool executed. Continue with your response or use another tool if needed."));
                     
-                    messages.push(ChatMessage::tool(&result_str, &tc.id));
+                    continue;
                 }
-                
-                messages.push(ChatMessage::user("Reflect on the results and decide next steps."));
-            } else {
-                final_content = response.content;
-                break;
             }
+
+            // No tool call, use content as final response
+            final_content = response.content;
+            break;
         }
-        
+
+        // If we have tool results but no final content, use the tool results as the response
+        if final_content.is_none() && !last_tool_results.is_empty() {
+            final_content = Some(last_tool_results.join("\n"));
+        }
+
         Ok((final_content, tools_used))
+    }
+
+    async fn parse_tool_call_from_json(&self, content: &str, tools: &crate::agent::tools::ToolRegistry) -> Option<ToolCallRequest> {
+        // Try to find JSON object in the content
+        let json_start = content.find("```json")?;
+        
+        // Find the closing ``` after json_start
+        let remaining = &content[json_start + 7..];
+        let json_end_in_remaining = remaining.find("```")?;
+        let json_end = json_start + 7 + json_end_in_remaining;
+        
+        let json_str = &content[json_start + 7..json_end].trim();
+        
+        #[derive(serde::Deserialize)]
+        struct ToolCallJson {
+            tool: String,
+            arguments: serde_json::Value,
+        }
+
+        match serde_json::from_str::<ToolCallJson>(json_str) {
+            Ok(call) => {
+                // Verify tool exists - use the 'tool' field, not 'name'
+                if tools.get(&call.tool).is_some() {
+                    Some(ToolCallRequest {
+                        id: format!("call_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)),
+                        name: call.tool,
+                        arguments: call.arguments,
+                    })
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
     }
 
     async fn consolidate_memory(&self) {
