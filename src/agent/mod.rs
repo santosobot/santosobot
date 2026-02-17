@@ -144,7 +144,7 @@ impl AgentLoop {
             )
         };
 
-        let (final_content, tools_used) = self.run_agent_loop(messages).await?;
+        let (final_content, tools_used) = self.run_agent_loop(messages, self.outbound_tx.clone(), msg.channel.clone(), msg.chat_id.clone()).await?;
 
         let response = final_content.unwrap_or_else(|| "I've completed processing but have no response to give.".to_string());
 
@@ -165,17 +165,10 @@ impl AgentLoop {
             self.consolidate_memory().await;
         }
 
-        let outbound = OutboundMessage::new(msg.channel.clone(), msg.chat_id.clone(), response.clone());
-        tracing::info!("Sending outbound message to channel: {}", msg.channel);
-        self.outbound_tx.send(outbound).await.map_err(|e| {
-            tracing::error!("Failed to send outbound message: {}", e);
-            e.to_string()
-        })?;
-
         Ok(())
     }
 
-    async fn run_agent_loop(&self, mut messages: Vec<ChatMessage>) -> Result<(Option<String>, Vec<String>), String> {
+    async fn run_agent_loop(&self, mut messages: Vec<ChatMessage>, outbound_tx: tokio::sync::mpsc::Sender<OutboundMessage>, channel: String, chat_id: String) -> Result<(Option<String>, Vec<String>), String> {
         let mut iteration = 0;
         let mut final_content: Option<String> = None;
         let mut tools_used = Vec::new();
@@ -188,9 +181,9 @@ impl AgentLoop {
             let _tool_defs = tools.get_definitions();
 
             tracing::info!("Iteration {}: Sending request", iteration);
-            
-            // Don't send tools parameter - model will use JSON format in prompt
-            let response = self.provider.chat(
+
+            // Use streaming chat
+            let mut stream = self.provider.chat_stream(
                 messages.clone(),
                 None,
                 Some(self.model.clone()),
@@ -198,34 +191,58 @@ impl AgentLoop {
                 Some(self.max_tokens),
             ).await.map_err(|e| e.to_string())?;
 
-            tracing::info!("LLM response: content length={:?}", response.content.as_ref().map(|c| c.len()));
-
-            // Check if response contains a tool call in JSON format
-            if let Some(content) = &response.content {
-                if let Some(tool_call) = self.parse_tool_call_from_json(content, &tools).await {
-                    tracing::info!("Parsed tool call: {}({:?})", tool_call.name, tool_call.arguments);
-                    tools_used.push(tool_call.name.clone());
-
-                    let result = tools
-                        .execute(&tool_call.name, serde_json::to_value(&tool_call.arguments).unwrap_or_default())
-                        .await;
-
-                    let result_str = match result {
-                        Ok(r) => r,
-                        Err(e) => format!("Error: {}", e),
-                    };
-
-                    last_tool_results.push(result_str.clone());
-                    messages.push(ChatMessage::assistant(content.clone()));
-                    messages.push(ChatMessage::tool(&result_str, &tool_call.id));
-                    messages.push(ChatMessage::user("Tool executed. Continue with your response or use another tool if needed."));
-                    
-                    continue;
+            let mut content = String::new();
+            use futures::StreamExt;
+            
+            // Send chunks in real-time
+            let mut chunk_count = 0;
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        content.push_str(&chunk);
+                        chunk_count += 1;
+                        
+                        // Send chunk every 4 chunks to avoid too many updates
+                        if chunk_count % 4 == 0 {
+                            let _ = outbound_tx.send(OutboundMessage::new(channel.clone(), chat_id.clone(), content.clone()).streaming()).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Stream error: {}", e);
+                        break;
+                    }
                 }
             }
 
+            // Send final content
+            let _ = outbound_tx.send(OutboundMessage::new(channel.clone(), chat_id.clone(), content.clone()).streaming()).await;
+
+            tracing::info!("LLM response: content length={:?}", content.len());
+
+            // Check if response contains a tool call in JSON format
+            if let Some(tool_call) = self.parse_tool_call_from_json(&content, &tools).await {
+                tracing::info!("Parsed tool call: {}({:?})", tool_call.name, tool_call.arguments);
+                tools_used.push(tool_call.name.clone());
+
+                let result = tools
+                    .execute(&tool_call.name, serde_json::to_value(&tool_call.arguments).unwrap_or_default())
+                    .await;
+
+                let result_str = match result {
+                    Ok(r) => r,
+                    Err(e) => format!("Error: {}", e),
+                };
+
+                last_tool_results.push(result_str.clone());
+                messages.push(ChatMessage::assistant(content.clone()));
+                messages.push(ChatMessage::tool(&result_str, &tool_call.id));
+                messages.push(ChatMessage::user("Tool executed. Continue with your response or use another tool if needed."));
+
+                continue;
+            }
+
             // No tool call, use content as final response
-            final_content = response.content;
+            final_content = Some(content);
             break;
         }
 
@@ -308,9 +325,9 @@ impl AgentLoop {
             Some("cli"),
             Some("direct"),
         );
-        
-        let (final_content, _) = self.run_agent_loop(messages).await?;
-        
+
+        let (final_content, _) = self.run_agent_loop(messages, self.outbound_tx.clone(), "cli".to_string(), "direct".to_string()).await?;
+
         Ok(final_content.unwrap_or_else(|| "No response".to_string()))
     }
 }

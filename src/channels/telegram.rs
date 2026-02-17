@@ -27,6 +27,7 @@ struct SendChatActionRequest {
 }
 
 #[derive(Serialize)]
+#[allow(dead_code)]
 struct EditMessageRequest {
     chat_id: i64,
     message_id: i64,
@@ -280,6 +281,7 @@ impl TelegramChannel {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn finalize_streaming(&self, chat_id: i64, message_id: i64, final_text: String) -> Result<(), String> {
         // Split large messages for final response
         let chunks = self.split_message(&final_text);
@@ -295,7 +297,7 @@ impl TelegramChannel {
         Ok(())
     }
 
-    async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<(), String> {
+    pub async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<(), String> {
         let url = format!("https://api.telegram.org/bot{}/sendChatAction", self.token);
 
         let request = SendChatActionRequest {

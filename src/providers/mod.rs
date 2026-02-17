@@ -21,6 +21,7 @@ impl OpenAIProvider {
         Self { client, config }
     }
 
+    #[allow(dead_code)]
     pub async fn chat(
         &self,
         messages: Vec<ChatMessage>,
@@ -64,6 +65,7 @@ impl OpenAIProvider {
         Ok(chat_resp.into())
     }
 
+    #[allow(dead_code)]
     pub async fn chat_stream(
         &self,
         messages: Vec<ChatMessage>,

@@ -167,12 +167,14 @@ pub struct LLMResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct StreamChoice {
     pub delta: StreamDelta,
     pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)]
 pub struct StreamDelta {
     #[serde(default)]
     pub role: Option<String>,
@@ -181,6 +183,7 @@ pub struct StreamDelta {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct StreamResponse {
     pub id: String,
     pub choices: Vec<StreamChoice>,
