@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use crate::bus::{InboundMessage, OutboundMessage};
 
+const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
+
 pub struct TelegramChannel {
     token: String,
     client: Client,
@@ -16,6 +18,12 @@ struct SendMessageRequest {
     text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_to_message_id: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct SendChatActionRequest {
+    chat_id: i64,
+    action: String,
 }
 
 #[derive(Deserialize)]
@@ -215,22 +223,101 @@ impl TelegramChannel {
 
     pub async fn send(&self, msg: OutboundMessage) -> Result<(), String> {
         let chat_id: i64 = msg.chat_id.parse().map_err(|_| "Invalid chat_id")?;
-        
-        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
-        
-        let request = SendMessageRequest {
+
+        // Send typing status first
+        let _ = self.send_chat_action(chat_id, "typing").await;
+
+        // Split large messages
+        let chunks = self.split_message(&msg.content);
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let reply_to = if i > 0 { Some(msg.chat_id.parse().unwrap_or(0)) } else { None };
+            self.send_message(chat_id, chunk.to_string(), reply_to).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn send_chat_action(&self, chat_id: i64, action: &str) -> Result<(), String> {
+        let url = format!("https://api.telegram.org/bot{}/sendChatAction", self.token);
+
+        let request = SendChatActionRequest {
             chat_id,
-            text: msg.content,
-            reply_to_message_id: None,
+            action: action.to_string(),
         };
-        
+
         self.client
             .post(&url)
             .json(&request)
             .send()
             .await
             .map_err(|e| e.to_string())?;
-        
+
         Ok(())
+    }
+
+    async fn send_message(&self, chat_id: i64, text: String, reply_to_message_id: Option<i64>) -> Result<(), String> {
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.token);
+
+        let request = SendMessageRequest {
+            chat_id,
+            text,
+            reply_to_message_id,
+        };
+
+        self.client
+            .post(&url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
+    fn split_message(&self, content: &str) -> Vec<String> {
+        let mut chunks = Vec::new();
+        let mut current = String::new();
+
+        for line in content.lines() {
+            if current.len() + line.len() + 1 > TELEGRAM_MAX_MESSAGE_LENGTH {
+                if !current.is_empty() {
+                    chunks.push(current);
+                    current = String::new();
+                }
+                
+                // If single line is too long, split it
+                if line.len() > TELEGRAM_MAX_MESSAGE_LENGTH {
+                    let mut start = 0;
+                    while start < line.len() {
+                        let end = start + TELEGRAM_MAX_MESSAGE_LENGTH;
+                        if end >= line.len() {
+                            chunks.push(line[start..].to_string());
+                            break;
+                        } else {
+                            // Try to split at word boundary
+                            let split_point = line[start..end].rfind(' ')
+                                .map(|p| start + p)
+                                .unwrap_or(end);
+                            chunks.push(line[start..split_point].to_string());
+                            start = split_point + 1;
+                        }
+                    }
+                } else {
+                    current.push_str(line);
+                }
+            } else {
+                if !current.is_empty() {
+                    current.push('\n');
+                }
+                current.push_str(line);
+            }
+        }
+
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+
+        chunks
     }
 }
