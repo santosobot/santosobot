@@ -166,6 +166,26 @@ pub struct LLMResponse {
     pub usage: Usage,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct StreamChoice {
+    pub delta: StreamDelta,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct StreamDelta {
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StreamResponse {
+    pub id: String,
+    pub choices: Vec<StreamChoice>,
+}
+
 impl LLMResponse {
     pub fn _has_tool_calls(&self) -> bool {
         !self.tool_calls.is_empty()

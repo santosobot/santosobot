@@ -44,6 +44,8 @@ pub struct OutboundMessage {
     pub chat_id: String,
     pub content: String,
     pub metadata: HashMap<String, String>,
+    pub message_id: Option<i64>,
+    pub is_streaming: bool,
 }
 
 impl OutboundMessage {
@@ -53,12 +55,26 @@ impl OutboundMessage {
             chat_id,
             content,
             metadata: HashMap::new(),
+            message_id: None,
+            is_streaming: false,
         }
     }
 
     #[allow(dead_code)]
     pub fn with_metadata(mut self, metadata: HashMap<String, String>) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_message_id(mut self, message_id: i64) -> Self {
+        self.message_id = Some(message_id);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn streaming(mut self) -> Self {
+        self.is_streaming = true;
         self
     }
 }

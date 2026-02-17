@@ -156,34 +156,34 @@ async fn run_agent_mode(message: Option<String>, config: Config) {
 async fn run_gateway_mode(config: Config) {
     print_banner();
     println!();
-    
+
     let (inbound_tx, inbound_rx) = mpsc::channel(100);
     let (outbound_tx, mut outbound_rx) = mpsc::channel(100);
-    
+
     let mut agent = AgentLoop::new(&config, inbound_rx, outbound_tx.clone());
-    
+
     tokio::spawn(async move {
         agent.run().await;
     });
-    
+
     let telegram_enabled = config.channels.telegram.enabled && !config.channels.telegram.token.is_empty();
-    
+
     if telegram_enabled {
         let telegram = TelegramChannel::new(
             config.channels.telegram.token.clone(),
             inbound_tx.clone(),
             config.channels.telegram.allow_from.clone(),
         );
-        
+
         tokio::spawn(async move {
             telegram.start().await;
         });
-        
+
         print_success("Telegram channel started");
     }
-    
+
     let telegram_config = config.channels.telegram;
-    
+
     tokio::spawn(async move {
         while let Some(msg) = outbound_rx.recv().await {
             match msg.channel.as_str() {
