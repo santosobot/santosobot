@@ -7,7 +7,6 @@ mod utils;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use config::Config;
@@ -185,12 +184,6 @@ async fn run_gateway_mode(config: Config) {
 
     let telegram_config = config.channels.telegram;
 
-    // Track streaming message IDs per chat
-    use std::collections::HashMap;
-    use tokio::sync::RwLock;
-    let streaming_messages: Arc<RwLock<HashMap<String, i64>>> = Arc::new(RwLock::new(HashMap::new()));
-    let streaming_messages_clone = streaming_messages.clone();
-
     tokio::spawn(async move {
         while let Some(msg) = outbound_rx.recv().await {
             match msg.channel.as_str() {
@@ -202,40 +195,13 @@ async fn run_gateway_mode(config: Config) {
                             telegram_config.allow_from.clone(),
                         );
 
-                        let chat_id: i64 = msg.chat_id.parse().unwrap_or(0);
-                        if chat_id != 0 {
-                            if msg.is_streaming {
-                                // Handle streaming: check if we have an existing message_id
-                                let mut streaming_map = streaming_messages_clone.write().await;
-
-                                if let Some(&message_id) = streaming_map.get(&msg.chat_id) {
-                                    // Send typing indicator before editing
-                                    let _ = telegram.send_chat_action(chat_id, "typing").await;
-                                    // Edit existing message
-                                    let _ = telegram.edit_message(chat_id, message_id, msg.content).await;
-                                } else {
-                                    // Send initial streaming message (already sends typing)
-                                    if let Ok(message_id) = telegram.send_streaming(msg.clone()).await {
-                                        streaming_map.insert(msg.chat_id.clone(), message_id);
-                                    }
-                                }
-                                drop(streaming_map);
-                            } else {
-                                // Regular non-streaming send
-                                let _ = telegram.send(msg).await;
-                            }
-                        } else {
-                            let _ = telegram.send(msg).await;
-                        }
+                        let _ = telegram.send(msg).await;
                     }
                 }
                 "cli" => println!("\nSantoso: {}", msg.content),
                 _ => tracing::warn!("Unknown channel: {}", msg.channel),
             }
         }
-
-        // Clean up streaming messages when done
-        let _ = streaming_messages_clone.write().await;
     });
 
     println!();

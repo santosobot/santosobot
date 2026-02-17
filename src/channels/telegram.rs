@@ -26,14 +26,6 @@ struct SendChatActionRequest {
     action: String,
 }
 
-#[derive(Serialize)]
-#[allow(dead_code)]
-struct EditMessageRequest {
-    chat_id: i64,
-    message_id: i64,
-    text: String,
-}
-
 #[derive(Deserialize)]
 #[allow(dead_code)]
 struct Update {
@@ -241,57 +233,6 @@ impl TelegramChannel {
         for (i, chunk) in chunks.iter().enumerate() {
             let reply_to = if i > 0 { Some(msg.chat_id.parse().unwrap_or(0)) } else { None };
             self.send_message(chat_id, chunk.to_string(), reply_to).await?;
-        }
-
-        Ok(())
-    }
-
-    pub async fn send_streaming(&self, msg: OutboundMessage) -> Result<i64, String> {
-        let chat_id: i64 = msg.chat_id.parse().map_err(|_| "Invalid chat_id")?;
-
-        // Send typing status first
-        let _ = self.send_chat_action(chat_id, "typing").await;
-
-        // Send initial empty message
-        let message_id = self.send_message(chat_id, "⏳ Generating response...".to_string(), None).await?;
-
-        Ok(message_id)
-    }
-
-    pub async fn edit_message(&self, chat_id: i64, message_id: i64, text: String) -> Result<(), String> {
-        // Split and edit only the first chunk if text is too long
-        let chunks = self.split_message(&text);
-        let text = chunks.first().unwrap_or(&text).clone();
-
-        let url = format!("https://api.telegram.org/bot{}/editMessageText", self.token);
-
-        let request = EditMessageRequest {
-            chat_id,
-            message_id,
-            text,
-        };
-
-        self.client
-            .post(&url)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub async fn finalize_streaming(&self, chat_id: i64, message_id: i64, final_text: String) -> Result<(), String> {
-        // Split large messages for final response
-        let chunks = self.split_message(&final_text);
-
-        // Edit the original message with first chunk
-        self.edit_message(chat_id, message_id, chunks.first().unwrap_or(&final_text).clone()).await?;
-
-        // Send additional chunks as replies
-        for (_i, chunk) in chunks.iter().enumerate().skip(1) {
-            self.send_message(chat_id, chunk.to_string(), Some(message_id)).await?;
         }
 
         Ok(())

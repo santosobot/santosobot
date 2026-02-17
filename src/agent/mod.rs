@@ -5,7 +5,7 @@ mod tools;
 pub use context::ContextBuilder;
 pub use memory::MemoryStore;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::RwLock;
 use serde::Deserialize;
 
@@ -46,8 +46,8 @@ impl AgentLoop {
     ) -> Self {
         let workspace = config.workspace_path();
         let provider = OpenAIProvider::new(config.provider.clone());
-        
-        let tools = Self::create_tools(&config, &workspace);
+
+        let tools = Self::create_tools(config, &workspace);
         
         Self {
             inbound_rx,
@@ -65,15 +65,15 @@ impl AgentLoop {
         }
     }
 
-    fn create_tools(config: &Config, workspace: &PathBuf) -> ToolRegistry {
+    fn create_tools(config: &Config, workspace: &Path) -> ToolRegistry {
         let mut tools = ToolRegistry::new();
         
         let allowed_dir = if config.tools.restrict_to_workspace {
-            Some(workspace.clone())
+            Some(workspace.to_path_buf())
         } else {
             None
         };
-        
+
         tools.register(ReadFileTool::new(allowed_dir.clone()));
         tools.register(WriteFileTool::new(allowed_dir.clone()));
         tools.register(EditFileTool::new(allowed_dir.clone()));
@@ -182,8 +182,8 @@ impl AgentLoop {
 
             tracing::info!("Iteration {}: Sending request", iteration);
 
-            // Use streaming chat
-            let mut stream = self.provider.chat_stream(
+            // Send chat request (non-streaming)
+            let llm_response = self.provider.chat(
                 messages.clone(),
                 None,
                 Some(self.model.clone()),
@@ -191,31 +191,10 @@ impl AgentLoop {
                 Some(self.max_tokens),
             ).await.map_err(|e| e.to_string())?;
 
-            let mut content = String::new();
-            use futures::StreamExt;
-            
-            // Send chunks in real-time
-            let mut chunk_count = 0;
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        content.push_str(&chunk);
-                        chunk_count += 1;
-                        
-                        // Send chunk every 4 chunks to avoid too many updates
-                        if chunk_count % 4 == 0 {
-                            let _ = outbound_tx.send(OutboundMessage::new(channel.clone(), chat_id.clone(), content.clone()).streaming()).await;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Stream error: {}", e);
-                        break;
-                    }
-                }
-            }
+            let content = llm_response.content.unwrap_or_default();
 
-            // Send final content
-            let _ = outbound_tx.send(OutboundMessage::new(channel.clone(), chat_id.clone(), content.clone()).streaming()).await;
+            // Send the complete response
+            let _ = outbound_tx.send(OutboundMessage::new(channel.clone(), chat_id.clone(), content.clone())).await;
 
             tracing::info!("LLM response: content length={:?}", content.len());
 
